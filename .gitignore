@@ -1,0 +1,8 @@
+.env
+chroma_db/
+uploads/
+__pycache__/
+*.pyc
+hello_ai.py
+rag_demo_defeat.py
+

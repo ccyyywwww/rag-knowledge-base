@@ -1,0 +1,17 @@
+# 第 3 周 Web 版 RAG 依赖清单
+# 安装：pip install -r requirements.txt
+# 如果大陆网络慢，加国内镜像：-i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# ---- Web 服务 ----
+fastapi          # Web 框架，提供 /upload、/ask 接口
+uvicorn          # ASGI 服务器，负责跑 FastAPI（pip install uvicorn 即可，基础版够用）
+python-multipart # FastAPI 接收上传文件必须装的依赖，缺了会报错
+
+# ---- 文档解析 ----
+pypdf            # 读取 PDF 文本（纯 Python 实现，无需额外二进制依赖）
+
+# ---- 第 2 周已有的（已装过） ----
+openai                   # 调千问 embedding + DeepSeek chat 的客户端
+python-dotenv            # 读取 .env
+chromadb                 # 向量数据库
+langchain-text-splitters # RecursiveCharacterTextSplitter
