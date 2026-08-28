@@ -42,7 +42,7 @@ collection = chroma_client.create_collection(name="knowledge_base")
 print("程序已启动，准备读取文件...")
 
 # 4. 读取文件内容
-file_path = "project/knowledge.txt"
+file_path = "project1_3/knowledge.txt"
 with open(file_path, "r", encoding="utf-8") as f:
     content = f.read()
 

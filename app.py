@@ -12,118 +12,156 @@ app.py — FastAPI 接口层（Web 入口）
 """
 
 import os
-# UUID = Universally Unique IDentifier（通用唯一标识符）。uuid4() 是其中一种生成算法（基于随机数）
+import json
 from uuid import uuid4
-# UploadFile：它是一个类型。
-# 当你在函数参数里写 file: UploadFile = File(...) 时，FastAPI 会把接收到的文件包装成一个 UploadFile 对象交给你
-from fastapi import FastAPI, UploadFile, File, HTTPException
-# FastAPI 提供的静态文件挂载器
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-# FileResponse：用来直接把服务器上的某个文件作为响应内容发送给客户端（比如点一个链接就自动下载 PDF）
-# JSONResponse：专门用来返回 JSON 格式数据的响应对象
-from fastapi.responses import FileResponse, JSONResponse
-# Pydantic 是 Python 最流行的数据校验库。BaseModel 是它的基类。
 from pydantic import BaseModel
+from typing import List
+from rag_engine import RAGEngine
 
-import rag_engine
+app = FastAPI(title="我的知识库", version="2.0")
+rag_engine = RAGEngine()
 
-# 创建 FastAPI 应用实例。title 只是文档里显示的名字，不影响功能
-app = FastAPI(title="PDF 知识库问答系统")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 
-# 把 static 目录挂载为静态资源，浏览器就能访问里面的 index.html
-app.mount("/static", StaticFiles(directory=os.path.join(rag_engine.BASE_DIR, "static")), name="static")
+# 确保上传目录存在
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# 确保上传目录存在（第一次运行时会自动创建）
-os.makedirs(rag_engine.UPLOAD_DIR, exist_ok=True)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-
-# ---------- 首页 ----------
-# 告诉 FastAPI：“如果用户发来一个 GET 请求，并且访问的路径是根路径 /（即域名后面什么都没带），就执行下面这个函数。”
-@app.get("/")
-async def index():
-    # 这不是注释，而是函数的 __doc__。FastAPI 会自动把它提取到自动生成的交互文档（/docs）里，方便团队协作
-    """把前端页面返回给浏览器。"""
-    return FileResponse(os.path.join(rag_engine.BASE_DIR, "static", "index.html"))
-
-
-# ---------- 上传接口 ----------
-@app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    """
-    接收上传的文档（PDF 或 TXT），解析入库。
-
-    UploadFile 是 FastAPI 对"上传文件"的封装。
-    它读取的流默认存在内存/临时文件里，必须先存到磁盘，rag_engine 才能读取。
-
-    安全措施：
-    1. basename + 扩展名白名单 + uuid 重命名 → 防路径穿越 / 同名覆盖
-    2. 边读边计数，超过 50MB 中止 → 防超大文件写爆磁盘
-    """
-    # ① 防路径穿越 + 防同名覆盖
-    # 不能直接用 file.filename：攻击者可传 "../../etc/passwd"，
-    # os.path.join 会拼出 uploads/../../etc/passwd，跳出上传目录。
-    filename = os.path.basename(file.filename)   # 去掉所有路径，只剩文件名
-    ext = os.path.splitext(filename)[1].lower()  # 取扩展名，如 ".pdf"
-
-    # 扩展名白名单。前端的 accept=".pdf,.txt" 只是给用户的提示，不是安全边界，
-    # 后端必须自己再校验一遍（攻击者可以不经过浏览器直接发请求）。
-    if ext not in {".pdf", ".txt"}:
-        raise HTTPException(status_code=400, detail=f"不支持的文件类型：{ext}")
-
-    # uuid 重命名：uuid4() 生成随机 32 位十六进制串，.hex 去掉连字符。
-    # 好处：同名文件不会互相覆盖，且隐藏了真实文件名（防扩展名伪装）。
-    safe_name = f"{uuid4().hex}{ext}"
-    file_path = os.path.join(rag_engine.UPLOAD_DIR, safe_name)
-
-    # ② 防超大文件
-    # 为什么不用 Content-Length 预判？两个原因：
-    #   1. 它是 HTTP 头，可以被攻击者伪造；
-    #   2. 分块传输（chunked）的请求根本没有这个头。
-    # 所以可靠做法是读取数据流时按字节累计，超限立即中止。
-    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
-
-    size = 0
-    try:
-        with open(file_path, "wb") as f:
-            while True:
-                chunk = await file.read(1024 * 1024)  # 每次读 1MB。注意 await：异步 I/O
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > MAX_FILE_SIZE:
-                    raise HTTPException(status_code=413, detail="文件超过 50MB 限制")
-                f.write(chunk)
-    except HTTPException:
-        # 超限时删除已写入的残留文件，别在磁盘上留垃圾
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        raise
-
-    # ③ 调用 RAG 引擎建库
-    try:
-        chunk_count = rag_engine.rebuild_knowledge_base(file_path)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": f"建库失败: {e}"})
-
-    return {"message": f"上传成功，已切分为 {chunk_count} 个片段", "chunk_count": chunk_count}
-
-
-# ---------- 提问接口 ----------
-class AskRequest(BaseModel):
-    """请求体。FastAPI 会自动校验 JSON 里必须有 question 字段。"""
+class QuestionRequest(BaseModel):
     question: str
 
+class DeleteRequest(BaseModel):
+    hashes: List[str]
+
+# --- API 路由 ---
+
+@app.get("/")
+async def read_root():
+    index_path = os.path.join(STATIC_DIR, "index.html")
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse("<h1>static/index.html 未找到</h1>")
+
+@app.post("/upload")
+async def upload_files(files: List[UploadFile] = File(...)):
+    """
+    批量上传文件，流式写入临时文件，避免内存溢出。
+
+    安全防护（v2.1 补回）：
+    1. 扩展名白名单：仅允许 .pdf / .txt
+    2. 每文件 50MB 大小限制：边读边计数，超限即中止
+    """
+    ALLOWED_EXT = {".pdf", ".txt"}
+    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+
+    # ① 先校验扩展名（不涉及文件写入，放在 try 外，错误直接以 400 返回）
+    for file in files:
+        ext = os.path.splitext(os.path.basename(file.filename))[1].lower()
+        if ext not in ALLOWED_EXT:
+            raise HTTPException(status_code=400, detail=f"不支持的文件类型：{ext}（仅支持 PDF / TXT）")
+
+    temp_paths = []
+    original_names = []
+    try:
+        for file in files:
+            # 生成安全的临时文件名（UUID + 原始基名）
+            safe_name = os.path.basename(file.filename)
+            temp_filename = f"{uuid4().hex}_{safe_name}"
+            temp_path = os.path.join(UPLOAD_DIR, temp_filename)
+
+            # ② 流式写入 + 大小限制：分块读取，超 50MB 立即中止
+            size = 0
+            with open(temp_path, "wb") as f:
+                while True:
+                    chunk = await file.read(1024 * 1024)  # 每次 1MB
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_FILE_SIZE:
+                        raise HTTPException(status_code=413, detail=f"文件 {safe_name} 超过 50MB 限制")
+                    f.write(chunk)
+
+            temp_paths.append(temp_path)
+            original_names.append(safe_name)
+
+        # ③ 调用 RAG 引擎处理（传入路径列表）
+        new_chunks = rag_engine.add_documents_from_paths(temp_paths, original_names)
+        return {"message": f"成功处理 {len(files)} 个文件，新增 {new_chunks} 个知识片段。"}
+
+    except HTTPException:
+        # 超限(413)等：清理已写入的临时文件后重新抛出，保留正确的状态码
+        for p in temp_paths:
+            if os.path.exists(p):
+                os.remove(p)
+        raise
+    except Exception as e:
+        # 其他异常：同样清理后返回 500
+        for p in temp_paths:
+            if os.path.exists(p):
+                os.remove(p)
+        print(f"Error during upload: {e}")
+        raise HTTPException(status_code=500, detail="文件处理失败")
 
 @app.post("/ask")
-async def ask(req: AskRequest):
-    """接收 {'question': '...'}，返回 {'answer': ..., 'sources': [...]}。"""
-    # 先检查知识库是否已建立。没上传过文档就提问，会让用户看到一串英文报错，
-    # 不如直接给一句中文提示。
-    if not rag_engine.has_knowledge_base():
-        return JSONResponse(status_code=400, content={"detail": "请先上传文档并建库，再开始提问"})
-
+async def ask_question(request: QuestionRequest):
+    question = request.question
+    if not question:
+        raise HTTPException(400, "问题不能为空")
     try:
-        result = rag_engine.ask(req.question)
+        result = rag_engine.query(question)
+        return JSONResponse(content={"answer": result["answer"], "sources": result["sources"]})
     except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": f"提问失败: {e}"})
-    return result
+        print(f"Error during query: {e}")
+        raise HTTPException(500, "回答生成失败")
+
+@app.get("/files")
+async def list_files():
+    """列出所有已入库文件（哈希 + 原始名）"""
+    index_path = os.path.join(BASE_DIR, "file_index.json")
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        files = [{"hash": h, "name": name} for h, name in data.items()]
+        return {"files": files}
+    return {"files": []}
+
+@app.get("/file/{file_hash}")
+async def get_file_content(file_hash: str):
+    """
+    根据文件哈希获取该文件的完整原文（合并所有片段）。
+    使用 where 条件直接查询，高效且精准。
+    """
+    from rag_engine import chroma_client
+    try:
+        collection = chroma_client.get_collection("knowledge_base")
+        # ★ 使用 where 过滤，无需扫描所有 ID
+        result = collection.get(where={"file_hash": file_hash})
+        docs = result["documents"]
+        if not docs:
+            raise HTTPException(404, "文件未找到")
+        # 按顺序排序（因为 ChromaDB 返回顺序可能与入库顺序不一致，我们按 ID 中的序号排序）
+        ids = result["ids"]
+        # 排序：按 _ 后的数字
+        sorted_pairs = sorted(zip(ids, docs), key=lambda x: int(x[0].split('_')[1]))
+        full_text = "\n".join([doc for _, doc in sorted_pairs])
+        return {"content": full_text}
+    except Exception as e:
+        print(f"Error getting file: {e}")
+        raise HTTPException(404, "文件未找到或内容为空")
+
+@app.delete("/files")
+async def delete_files(request: DeleteRequest):
+    """批量删除文件（通过哈希列表），使用 where 条件原子删除"""
+    try:
+        deleted = rag_engine.delete_files(request.hashes)
+        return {"deleted": deleted}
+    except Exception as e:
+        print(f"Error deleting files: {e}")
+        raise HTTPException(status_code=500, detail="删除失败")
